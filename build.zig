@@ -3,7 +3,9 @@ const Builder = @import("std").build.Builder;
 pub fn build(b: *Builder) void {
     const mode = b.standardReleaseOptions();
     const exe = b.addExecutable("build_your_own_lisp", "src/main.zig");
+    exe.addCSourceFile("mpc/mpc.c", &[_][]const u8{"-std=c99"});
     exe.setBuildMode(mode);
+    exe.addIncludeDir("mpc");
     exe.linkSystemLibrary("c");
     exe.install();
 
