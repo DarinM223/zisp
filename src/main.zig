@@ -1,7 +1,34 @@
 const std = @import("std");
 const c = @import("c.zig");
 
-pub fn repl() std.os.ReadError!void {
+const EvalError = error{InvalidOp};
+
+pub fn eval(node: *c.mpc_ast_t) EvalError!i64 {
+    if (c.strstr(node.*.tag, "number") != 0) {
+        return c.atoi(node.*.contents);
+    }
+
+    const op = node.*.children[1].*.contents;
+    var result = try eval(node.*.children[2]);
+    var i: usize = 3;
+    while (c.strstr(node.*.children[i].*.tag, "expr") != 0) : (i += 1) {
+        result = try eval_op(result, op, try eval(node.*.children[i]));
+    }
+    return result;
+}
+
+fn eval_op(a: i64, op: *u8, b: i64) EvalError!i64 {
+    if (c.strcmp(op, "+") == 0) return a + b;
+    if (c.strcmp(op, "-") == 0) return a - b;
+    if (c.strcmp(op, "*") == 0) return a * b;
+    if (c.strcmp(op, "/") == 0) return @divTrunc(a, b);
+    return EvalError.InvalidOp;
+}
+
+// Combine errors with ||
+const ReplError = EvalError || std.os.ReadError;
+
+pub fn repl() ReplError!void {
     const Number = c.mpc_new("number");
     const Operator = c.mpc_new("operator");
     const Expr = c.mpc_new("expr");
@@ -27,7 +54,8 @@ pub fn repl() std.os.ReadError!void {
         var r: c.mpc_result_t = undefined;
         if (c.mpc_parse("<stdin>", input[0..bytes_read].ptr, Lispy, &r) != 0) {
             var ptr = @ptrCast(*c.mpc_ast_t, @alignCast(@alignOf(c.mpc_ast_t), r.output.?));
-            c.mpc_ast_print(ptr);
+            var result = try eval(ptr);
+            std.debug.warn("{}\n", .{result});
             c.mpc_ast_delete(ptr);
         } else {
             var ptr = @ptrCast([*c]c.mpc_err_t, @field(r, "error").?);
