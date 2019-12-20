@@ -1,7 +1,10 @@
 const std = @import("std");
 const c = @import("c.zig");
 
-const EvalError = error{InvalidOp};
+const EvalError = error{
+    InvalidOp,
+    DivideByZero,
+};
 
 pub fn eval(node: *c.mpc_ast_t) EvalError!i64 {
     if (c.strstr(node.*.tag, "number") != 0) {
@@ -21,7 +24,13 @@ fn eval_op(a: i64, op: *u8, b: i64) EvalError!i64 {
     if (c.strcmp(op, "+") == 0) return a + b;
     if (c.strcmp(op, "-") == 0) return a - b;
     if (c.strcmp(op, "*") == 0) return a * b;
-    if (c.strcmp(op, "/") == 0) return @divTrunc(a, b);
+    if (c.strcmp(op, "/") == 0) {
+        if (b == 0) {
+            return EvalError.DivideByZero;
+        } else {
+            return @divTrunc(a, b);
+        }
+    }
     return EvalError.InvalidOp;
 }
 
@@ -54,13 +63,19 @@ pub fn repl() ReplError!void {
         var r: c.mpc_result_t = undefined;
         if (c.mpc_parse("<stdin>", input[0..bytes_read].ptr, Lispy, &r) != 0) {
             var ptr = @ptrCast(*c.mpc_ast_t, @alignCast(@alignOf(c.mpc_ast_t), r.output.?));
-            var result = try eval(ptr);
+            defer c.mpc_ast_delete(ptr);
+            var result = eval(ptr) catch |e| switch (e) {
+                EvalError.DivideByZero => {
+                    std.debug.warn("Divide by zero\n", .{});
+                    continue;
+                },
+                else => |err| return err,
+            };
             std.debug.warn("{}\n", .{result});
-            c.mpc_ast_delete(ptr);
         } else {
             var ptr = @ptrCast([*c]c.mpc_err_t, @field(r, "error").?);
+            defer c.mpc_err_delete(ptr);
             c.mpc_err_print(ptr);
-            c.mpc_err_delete(ptr);
         }
     }
 }
