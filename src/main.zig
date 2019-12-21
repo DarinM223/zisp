@@ -5,6 +5,8 @@ const Allocator = std.mem.Allocator;
 const EvalError = error{
     InvalidOp,
     DivideByZero,
+    FunctionNoSymbolStart,
+    NotANumber,
 };
 
 const Tag = enum {
@@ -56,25 +58,77 @@ const LValTagged = union(Tag) {
         switch (self.*) {
             .Num => return self,
             .Sym => return self,
-            .Sexpr => |cells_opt| {
-                if (cells_opt) |cells| {
+            .Sexpr => |*cells_opt| {
+                if (cells_opt.*) |cells| {
                     if (cells.len == 0) return self;
 
-                    defer self.free(allocator);
+                    // On error, just clean up cells (if you clean up the whole value
+                    // the stack call above it will be pointing to garbage).
+                    // However, whenever you successfully return a new value,
+                    // remember to clean up the whole value (self).
+                    errdefer {
+                        LValTagged.free_cells(cells, allocator);
+                        cells_opt.* = null;
+                    }
+
                     for (cells) |*cell| {
                         cell.* = try cell.*.destructive_eval(allocator);
                     }
 
-                    if (cells.len == 1) return LValTagged.pop(allocator, cells, 0);
+                    if (cells.len == 1) {
+                        const result = LValTagged.pop(allocator, cells, 0);
+                        defer self.free(allocator);
+                        return result;
+                    }
 
-                    var f = LValTagged.pop(allocator, cells, 0);
+                    const f = LValTagged.pop(allocator, cells, 0);
                     defer f.free(allocator);
 
-                    return undefined;
+                    switch (f.*) {
+                        .Sym => |sym| {
+                            const result = try LValTagged.builtin_op(allocator, cells, sym);
+                            defer self.free(allocator);
+                            return result;
+                        },
+                        else => return EvalError.FunctionNoSymbolStart,
+                    }
                 } else {
                     return self;
                 }
             },
+        }
+    }
+
+    fn builtin_op(allocator: *Allocator, slice: []*LValTagged, sym: []u8) EvalError!*LValTagged {
+        const x = LValTagged.pop(allocator, slice, 0);
+        errdefer x.free(allocator);
+
+        switch (x.*) {
+            .Num => |*num| {
+                if (std.mem.eql(u8, sym, "-") and slice.len == 0) {
+                    num.* = -num.*;
+                    return x;
+                }
+
+                var i: usize = 0;
+                while (i < slice.len) : (i += 1) {
+                    switch (slice[i].*) {
+                        .Num => |other_num| {
+                            if (std.mem.eql(u8, sym, "+")) num.* += other_num;
+                            if (std.mem.eql(u8, sym, "-")) num.* -= other_num;
+                            if (std.mem.eql(u8, sym, "*")) num.* *= other_num;
+                            if (std.mem.eql(u8, sym, "/")) {
+                                if (other_num == 0)
+                                    return EvalError.DivideByZero;
+                                num.* = @divTrunc(num.*, other_num);
+                            }
+                        },
+                        else => return EvalError.NotANumber,
+                    }
+                }
+                return x;
+            },
+            else => return EvalError.NotANumber,
         }
     }
 
@@ -84,12 +138,6 @@ const LValTagged = union(Tag) {
         slice = allocator.shrink(slice, slice.len - 1);
         return value;
     }
-
-    //fn take(allocator: *Allocator, slice: []*LValTagged, index: usize) *LValTagged {
-    //    var x = LValTagged.pop(allocator, slice, index);
-    //    defer LValTagged.free_cells(slice, allocator);
-    //    return x;
-    //}
 };
 
 const LVal = struct {
@@ -246,9 +294,9 @@ pub fn repl() ReplError!void {
 
             var lval = try lval_read(std.heap.direct_allocator, ptr);
             defer lval.deinit();
-            lval.print();
 
             try lval.eval();
+            lval.print();
 
             //var result = eval(ptr) catch |e| switch (e) {
             //    EvalError.DivideByZero => {
