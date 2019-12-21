@@ -18,19 +18,78 @@ const LValTagged = union(Tag) {
     Sym: []u8,
     Sexpr: ?[]*LValTagged,
 
-    fn free(tagged: *LValTagged, allocator: *Allocator) void {
-        switch (tagged.*) {
+    const Self = @This();
+
+    fn free(self: *Self, allocator: *Allocator) void {
+        switch (self.*) {
             .Num => {},
             .Sym => |sym| allocator.free(sym),
-            .Sexpr => |cells_opt| if (cells_opt) |cells| {
-                for (cells) |child_tagged| {
-                    LValTagged.free(child_tagged, allocator);
+            .Sexpr => |cells_opt| if (cells_opt) |cells|
+                LValTagged.free_cells(cells, allocator),
+        }
+        allocator.destroy(self);
+    }
+
+    fn free_cells(cells: []*LValTagged, allocator: *Allocator) void {
+        for (cells) |child_tagged| {
+            child_tagged.free(allocator);
+        }
+        allocator.free(cells);
+    }
+
+    fn print(self: *Self) void {
+        switch (self.*) {
+            .Num => |i| std.debug.warn("{}", .{i}),
+            .Sym => |s| std.debug.warn("{}", .{s}),
+            .Sexpr => |sexpr_opt| if (sexpr_opt) |sexpr| {
+                std.debug.warn("(", .{});
+                for (sexpr) |child_tagged, i| {
+                    child_tagged.print();
+                    if (i != sexpr.len - 1) std.debug.warn(" ", .{});
                 }
-                allocator.free(cells);
+                std.debug.warn(")", .{});
             },
         }
-        allocator.destroy(tagged);
     }
+
+    fn destructive_eval(self: *Self, allocator: *Allocator) EvalError!*LValTagged {
+        switch (self.*) {
+            .Num => return self,
+            .Sym => return self,
+            .Sexpr => |cells_opt| {
+                if (cells_opt) |cells| {
+                    if (cells.len == 0) return self;
+
+                    defer self.free(allocator);
+                    for (cells) |*cell| {
+                        cell.* = try cell.*.destructive_eval(allocator);
+                    }
+
+                    if (cells.len == 1) return LValTagged.pop(allocator, cells, 0);
+
+                    var f = LValTagged.pop(allocator, cells, 0);
+                    defer f.free(allocator);
+
+                    return undefined;
+                } else {
+                    return self;
+                }
+            },
+        }
+    }
+
+    fn pop(allocator: *Allocator, slice: []*LValTagged, index: usize) *LValTagged {
+        const value = slice[index];
+        std.mem.copy(*LValTagged, slice[index..], slice[index + 1 ..]);
+        slice = allocator.shrink(slice, slice.len - 1);
+        return value;
+    }
+
+    //fn take(allocator: *Allocator, slice: []*LValTagged, index: usize) *LValTagged {
+    //    var x = LValTagged.pop(allocator, slice, index);
+    //    defer LValTagged.free_cells(slice, allocator);
+    //    return x;
+    //}
 };
 
 const LVal = struct {
@@ -65,29 +124,18 @@ const LVal = struct {
     }
 
     fn deinit(self: Self) void {
-        LValTagged.free(self.tagged, self.allocator);
+        self.tagged.free(self.allocator);
     }
 
     fn print(self: Self) void {
-        tagged_print(self.tagged);
+        self.tagged.print();
         std.debug.warn("\n", .{});
     }
-};
 
-fn tagged_print(tagged: *LValTagged) void {
-    switch (tagged.*) {
-        .Num => |i| std.debug.warn("{}", .{i}),
-        .Sym => |s| std.debug.warn("{}", .{s}),
-        .Sexpr => |sexpr_opt| if (sexpr_opt) |sexpr| {
-            std.debug.warn("(", .{});
-            for (sexpr) |child_tagged, i| {
-                tagged_print(child_tagged);
-                if (i != sexpr.len - 1) std.debug.warn(" ", .{});
-            }
-            std.debug.warn(")", .{});
-        },
+    fn eval(self: *Self) EvalError!void {
+        self.tagged = try self.tagged.destructive_eval(self.allocator);
     }
-}
+};
 
 const ReadError = Allocator.Error || error{InvalidNum};
 
@@ -198,8 +246,9 @@ pub fn repl() ReplError!void {
 
             var lval = try lval_read(std.heap.direct_allocator, ptr);
             defer lval.deinit();
-
             lval.print();
+
+            try lval.eval();
 
             //var result = eval(ptr) catch |e| switch (e) {
             //    EvalError.DivideByZero => {
