@@ -35,17 +35,14 @@ const LValTagged = union(Tag) {
         switch (self.*) {
             .Num => {},
             .Sym => |sym| allocator.free(sym),
-            .Sexpr => |cells_opt| if (cells_opt) |cells|
-                LValTagged.free_cells(cells, allocator),
+            .Sexpr => |cells_opt| if (cells_opt) |cells| {
+                for (cells) |child_tagged| {
+                    child_tagged.free(allocator);
+                }
+                allocator.free(cells);
+            },
         }
         allocator.destroy(self);
-    }
-
-    fn free_cells(cells: []*LValTagged, allocator: *Allocator) void {
-        for (cells) |child_tagged| {
-            child_tagged.free(allocator);
-        }
-        allocator.free(cells);
     }
 
     fn print(self: *Self) void {
@@ -63,33 +60,27 @@ const LValTagged = union(Tag) {
         }
     }
 
-    fn destructive_eval(self: *Self, allocator: *Allocator) EvalError!*LValTagged {
+    fn eval(self: *Self, allocator: *Allocator) EvalError!*LValTagged {
         switch (self.*) {
             .Num => return self,
             .Sym => return self,
-            .Sexpr => |*cells_opt| {
-                if (cells_opt.*) |cells| {
+            .Sexpr => |cells_opt| {
+                if (cells_opt) |cells| {
                     if (cells.len == 0) return self;
 
                     for (cells) |*cell| {
-                        cell.* = try cell.*.destructive_eval(allocator);
+                        const new_cell = try cell.*.eval(allocator);
+                        if (new_cell != cell.*) cell.*.free(allocator);
+                        cell.* = new_cell;
                     }
 
-                    if (cells.len == 1) {
-                        const result = LValTagged.pop(allocator, cells, 0);
-                        defer self.free(allocator);
-                        return result;
-                    }
+                    if (cells.len == 1) return LValTagged.pop(allocator, cells, 0);
 
                     const f = LValTagged.pop(allocator, cells, 0);
                     defer f.free(allocator);
 
                     switch (f.*) {
-                        .Sym => |sym| {
-                            const result = try LValTagged.builtin_op(allocator, cells, sym);
-                            defer self.free(allocator);
-                            return result;
-                        },
+                        .Sym => |sym| return try LValTagged.builtin_op(allocator, cells, sym),
                         else => return EvalError.FunctionNoSymbolStart,
                     }
                 } else {
@@ -181,7 +172,9 @@ const LVal = struct {
     }
 
     fn eval(self: *Self) EvalError!void {
-        self.tagged = try self.tagged.destructive_eval(self.allocator);
+        const new_tagged = try self.tagged.eval(self.allocator);
+        if (new_tagged != self.tagged) self.tagged.free(self.allocator);
+        self.tagged = new_tagged;
     }
 };
 
