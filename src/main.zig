@@ -9,6 +9,15 @@ const EvalError = error{
     NotANumber,
 };
 
+fn eval_error_str(err: EvalError) []const u8 {
+    return switch (err) {
+        EvalError.InvalidOp => "Invalid Operation",
+        EvalError.DivideByZero => "Division by zero",
+        EvalError.FunctionNoSymbolStart => "Function doesn't start with symbol",
+        EvalError.NotANumber => "Not a number",
+    };
+}
+
 const Tag = enum {
     Num,
     Sym,
@@ -61,15 +70,6 @@ const LValTagged = union(Tag) {
             .Sexpr => |*cells_opt| {
                 if (cells_opt.*) |cells| {
                     if (cells.len == 0) return self;
-
-                    // On error, just clean up cells (if you clean up the whole value
-                    // the stack call above it will be pointing to garbage).
-                    // However, whenever you successfully return a new value,
-                    // remember to clean up the whole value (self).
-                    errdefer {
-                        LValTagged.free_cells(cells, allocator);
-                        cells_opt.* = null;
-                    }
 
                     for (cells) |*cell| {
                         cell.* = try cell.*.destructive_eval(allocator);
@@ -189,30 +189,30 @@ const ReadError = Allocator.Error || error{InvalidNum};
 
 fn lval_read_num(allocator: *Allocator, node: *c.mpc_ast_t) ReadError!LVal {
     var x: c_long = undefined;
-    if (c.parseLong(node.*.contents, &x) == 0) {
+    if (c.parseLong(node.contents, &x) == 0) {
         return ReadError.InvalidNum;
     }
     return LVal.num_init(allocator, x);
 }
 
 fn lval_read(allocator: *Allocator, node: *c.mpc_ast_t) ReadError!LVal {
-    if (c.strstr(node.*.tag, "number") != 0)
+    if (c.strstr(node.tag, "number") != 0)
         return lval_read_num(allocator, node);
-    if (c.strstr(node.*.tag, "symbol") != 0)
+    if (c.strstr(node.tag, "symbol") != 0)
         return LVal.sym_init(allocator, node.*.contents);
 
     var x: ?LVal = null;
     errdefer if (x) |true_x| true_x.deinit();
 
-    if (c.strcmp(node.*.tag, ">") == 0) x = try LVal.sexpr_init(allocator);
-    if (c.strstr(node.*.tag, "sexpr") != 0) x = try LVal.sexpr_init(allocator);
+    if (c.strcmp(node.tag, ">") == 0) x = try LVal.sexpr_init(allocator);
+    if (c.strstr(node.tag, "sexpr") != 0) x = try LVal.sexpr_init(allocator);
 
     var i: usize = 0;
-    while (i < node.*.children_num) : (i += 1) {
-        if (c.strcmp(node.*.children[i].*.contents, "(") == 0) continue;
-        if (c.strcmp(node.*.children[i].*.contents, ")") == 0) continue;
-        if (c.strcmp(node.*.children[i].*.tag, "regex") == 0) continue;
-        x = try lval_add(allocator, x.?, try lval_read(allocator, node.*.children[i]));
+    while (i < node.children_num) : (i += 1) {
+        if (c.strcmp(node.children[i].*.contents, "(") == 0) continue;
+        if (c.strcmp(node.children[i].*.contents, ")") == 0) continue;
+        if (c.strcmp(node.children[i].*.tag, "regex") == 0) continue;
+        x = try lval_add(allocator, x.?, try lval_read(allocator, node.children[i]));
     }
     return x.?;
 }
@@ -234,15 +234,15 @@ fn lval_add(allocator: *Allocator, v: LVal, x: LVal) ReadError!LVal {
 }
 
 pub fn eval(node: *c.mpc_ast_t) EvalError!i64 {
-    if (c.strstr(node.*.tag, "number") != 0) {
-        return c.atoi(node.*.contents);
+    if (c.strstr(node.tag, "number") != 0) {
+        return c.atoi(node.contents);
     }
 
-    const op = node.*.children[1].*.contents;
-    var result = try eval(node.*.children[2]);
+    const op = node.children[1].*.contents;
+    var result = try eval(node.children[2]);
     var i: usize = 3;
-    while (c.strstr(node.*.children[i].*.tag, "expr") != 0) : (i += 1) {
-        result = try eval_op(result, op, try eval(node.*.children[i]));
+    while (c.strstr(node.children[i].*.tag, "expr") != 0) : (i += 1) {
+        result = try eval_op(result, op, try eval(node.children[i]));
     }
     return result;
 }
@@ -295,7 +295,13 @@ pub fn repl() ReplError!void {
             var lval = try lval_read(std.heap.direct_allocator, ptr);
             defer lval.deinit();
 
-            try lval.eval();
+            lval.eval() catch |e| switch (e) {
+                EvalError.InvalidOp, EvalError.DivideByZero, EvalError.FunctionNoSymbolStart, EvalError.NotANumber => {
+                    std.debug.warn("{}\n", .{eval_error_str(e)});
+                    continue;
+                },
+                else => |err| return err,
+            };
             lval.print();
 
             //var result = eval(ptr) catch |e| switch (e) {
