@@ -22,12 +22,14 @@ const Tag = enum {
     Num,
     Sym,
     Sexpr,
+    Qexpr,
 };
 
 const LValTagged = union(Tag) {
     Num: i64,
     Sym: []u8,
     Sexpr: ?[]*LValTagged,
+    Qexpr: ?[]*LValTagged,
 
     const Self = @This();
 
@@ -35,7 +37,7 @@ const LValTagged = union(Tag) {
         switch (self.*) {
             .Num => {},
             .Sym => |sym| allocator.free(sym),
-            .Sexpr => |cells_opt| if (cells_opt) |cells| {
+            .Sexpr, .Qexpr => |cells_opt| if (cells_opt) |cells| {
                 for (cells) |child_tagged| {
                     child_tagged.free(allocator);
                 }
@@ -49,15 +51,18 @@ const LValTagged = union(Tag) {
         switch (self.*) {
             .Num => |i| std.debug.warn("{}", .{i}),
             .Sym => |s| std.debug.warn("{}", .{s}),
-            .Sexpr => |sexpr_opt| if (sexpr_opt) |sexpr| {
-                std.debug.warn("(", .{});
-                for (sexpr) |child_tagged, i| {
-                    child_tagged.print();
-                    if (i != sexpr.len - 1) std.debug.warn(" ", .{});
-                }
-                std.debug.warn(")", .{});
-            },
+            .Sexpr => |sexpr_opt| if (sexpr_opt) |sexpr| expr_print(sexpr, "(", ")"),
+            .Qexpr => |qexpr_opt| if (qexpr_opt) |qexpr| expr_print(qexpr, "{", "}"),
         }
+    }
+
+    fn expr_print(cells: []*LValTagged, open: []const u8, close: []const u8) void {
+        std.debug.warn("{}", .{open});
+        for (cells) |child_tagged, i| {
+            child_tagged.print();
+            if (i != cells.len - 1) std.debug.warn(" ", .{});
+        }
+        std.debug.warn("{}", .{close});
     }
 
     fn eval(self: *Self, allocator: *Allocator) EvalError!*LValTagged {
@@ -74,24 +79,25 @@ const LValTagged = union(Tag) {
                         cell.* = new_cell;
                     }
 
-                    if (cells.len == 1) return LValTagged.pop(allocator, cells, 0);
+                    if (cells.len == 1) return pop(allocator, cells, 0);
 
-                    const f = LValTagged.pop(allocator, cells, 0);
+                    const f = pop(allocator, cells, 0);
                     defer f.free(allocator);
 
                     switch (f.*) {
-                        .Sym => |sym| return try LValTagged.builtin_op(allocator, cells, sym),
+                        .Sym => |sym| return try builtin_op(allocator, cells, sym),
                         else => return EvalError.FunctionNoSymbolStart,
                     }
                 } else {
                     return self;
                 }
             },
+            .Qexpr => return self,
         }
     }
 
     fn builtin_op(allocator: *Allocator, slice: []*LValTagged, sym: []u8) EvalError!*LValTagged {
-        const x = LValTagged.pop(allocator, slice, 0);
+        const x = pop(allocator, slice, 0);
         errdefer x.free(allocator);
 
         switch (x.*) {
@@ -162,6 +168,12 @@ const LVal = struct {
         return LVal{ .tagged = lval, .allocator = allocator };
     }
 
+    fn qexpr_init(allocator: *Allocator) Allocator.Error!Self {
+        var lval = try allocator.create(LValTagged);
+        lval.* = LValTagged{ .Qexpr = null };
+        return LVal{ .tagged = lval, .allocator = allocator };
+    }
+
     fn deinit(self: Self) void {
         self.tagged.free(self.allocator);
     }
@@ -199,11 +211,14 @@ fn lval_read(allocator: *Allocator, node: *c.mpc_ast_t) ReadError!LVal {
 
     if (c.strcmp(node.tag, ">") == 0) x = try LVal.sexpr_init(allocator);
     if (c.strstr(node.tag, "sexpr") != 0) x = try LVal.sexpr_init(allocator);
+    if (c.strstr(node.tag, "qexpr") != 0) x = try LVal.qexpr_init(allocator);
 
     var i: usize = 0;
     while (i < node.children_num) : (i += 1) {
         if (c.strcmp(node.children[i].*.contents, "(") == 0) continue;
         if (c.strcmp(node.children[i].*.contents, ")") == 0) continue;
+        if (c.strcmp(node.children[i].*.contents, "{") == 0) continue;
+        if (c.strcmp(node.children[i].*.contents, "}") == 0) continue;
         if (c.strcmp(node.children[i].*.tag, "regex") == 0) continue;
         x = try lval_add(allocator, x.?, try lval_read(allocator, node.children[i]));
     }
@@ -212,13 +227,13 @@ fn lval_read(allocator: *Allocator, node: *c.mpc_ast_t) ReadError!LVal {
 
 fn lval_add(allocator: *Allocator, v: LVal, x: LVal) ReadError!LVal {
     switch (v.tagged.*) {
-        .Sexpr => |*sexpr_opt| {
-            if (sexpr_opt.*) |*sexpr| {
-                sexpr.* = try allocator.realloc(sexpr.*, sexpr.*.len + 1);
-                sexpr.*[sexpr.*.len - 1] = x.tagged;
+        .Sexpr, .Qexpr => |*expr_opt| {
+            if (expr_opt.*) |*expr| {
+                expr.* = try allocator.realloc(expr.*, expr.*.len + 1);
+                expr.*[expr.*.len - 1] = x.tagged;
             } else {
-                sexpr_opt.* = try allocator.alloc(*LValTagged, 1);
-                sexpr_opt.*.?[0] = x.tagged;
+                expr_opt.* = try allocator.alloc(*LValTagged, 1);
+                expr_opt.*.?[0] = x.tagged;
             }
         },
         else => {},
@@ -261,6 +276,7 @@ pub fn repl() ReplError!void {
     const Number = c.mpc_new("number");
     const Symbol = c.mpc_new("symbol");
     const Sexpr = c.mpc_new("sexpr");
+    const Qexpr = c.mpc_new("qexpr");
     const Expr = c.mpc_new("expr");
     const Lispy = c.mpc_new("lispy");
 
@@ -268,10 +284,11 @@ pub fn repl() ReplError!void {
         \\ number   : /-?[0-9]+/ ;
         \\ symbol   : '+' | '-' | '*' | '/' ;
         \\ sexpr    : '(' <expr>* ')' ;
-        \\ expr     : <number> | <symbol> | <sexpr> ;
+        \\ qexpr    : '{' <expr>* '}' ;
+        \\ expr     : <number> | <symbol> | <sexpr> | <qexpr> ;
         \\ lispy    : /^/ <expr>* /$/ ;
-    , Number, Symbol, Sexpr, Expr, Lispy);
-    defer c.mpc_cleanup(4, Number, Symbol, Sexpr, Expr, Lispy);
+    , Number, Symbol, Sexpr, Qexpr, Expr, Lispy);
+    defer c.mpc_cleanup(4, Number, Symbol, Sexpr, Qexpr, Expr, Lispy);
 
     var input: [2048]u8 = undefined;
     const stdin = std.io.getStdIn();
