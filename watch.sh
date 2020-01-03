@@ -2,5 +2,5 @@
 
 while inotifywait -qqre modify "./src"; do
     clear
-    zig build
+    zig build test
 done

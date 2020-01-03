@@ -12,6 +12,10 @@ pub fn build(b: *Builder) void {
     const run_cmd = exe.run();
     run_cmd.step.dependOn(b.getInstallStep());
 
+    const test_step = b.step("test", "Test the app");
+    const main_test = b.addTest("./src/main.zig");
+    test_step.dependOn(&main_test.step);
+
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 }

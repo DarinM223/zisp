@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = @import("std").debug.assert;
 const c = @import("c.zig");
 const Allocator = std.mem.Allocator;
 
@@ -7,6 +8,8 @@ const EvalError = error{
     DivideByZero,
     FunctionNoSymbolStart,
     NotANumber,
+    TooManyArguments,
+    IncorrectTypes,
 };
 
 fn eval_error_str(err: EvalError) []const u8 {
@@ -15,6 +18,8 @@ fn eval_error_str(err: EvalError) []const u8 {
         EvalError.DivideByZero => "Division by zero",
         EvalError.FunctionNoSymbolStart => "Function doesn't start with symbol",
         EvalError.NotANumber => "Not a number",
+        EvalError.TooManyArguments => "Too many arguments",
+        EvalError.IncorrectTypes => "Incorrect types",
     };
 }
 
@@ -96,39 +101,6 @@ const LValTagged = union(Tag) {
         }
     }
 
-    fn builtin_op(allocator: *Allocator, slice: []*LValTagged, sym: []u8) EvalError!*LValTagged {
-        const x = pop(allocator, slice, 0);
-        errdefer x.free(allocator);
-
-        switch (x.*) {
-            .Num => |*num| {
-                if (std.mem.eql(u8, sym, "-") and slice.len == 0) {
-                    num.* = -num.*;
-                    return x;
-                }
-
-                var i: usize = 0;
-                while (i < slice.len) : (i += 1) {
-                    switch (slice[i].*) {
-                        .Num => |other_num| {
-                            if (std.mem.eql(u8, sym, "+")) num.* += other_num;
-                            if (std.mem.eql(u8, sym, "-")) num.* -= other_num;
-                            if (std.mem.eql(u8, sym, "*")) num.* *= other_num;
-                            if (std.mem.eql(u8, sym, "/")) {
-                                if (other_num == 0)
-                                    return EvalError.DivideByZero;
-                                num.* = @divTrunc(num.*, other_num);
-                            }
-                        },
-                        else => return EvalError.NotANumber,
-                    }
-                }
-                return x;
-            },
-            else => return EvalError.NotANumber,
-        }
-    }
-
     fn pop(allocator: *Allocator, slice: []*LValTagged, index: usize) *LValTagged {
         const value = slice[index];
         std.mem.copy(*LValTagged, slice[index..], slice[index + 1 ..]);
@@ -136,6 +108,59 @@ const LValTagged = union(Tag) {
         return value;
     }
 };
+
+fn builtin_head(allocator: *Allocator, slice: []*LValTagged) EvalError!*LValTagged {
+    if (slice.len != 1) return EvalError.TooManyArguments;
+
+    const v = LValTagged.pop(allocator, slice, 0);
+    defer v.free(allocator);
+
+    switch (v.*) {
+        .Qexpr => |cells_opt| if (cells_opt) |cells|
+            return LValTagged.pop(allocator, cells, 0),
+        else => {},
+    }
+    return EvalError.IncorrectTypes;
+}
+
+fn builtin_op(allocator: *Allocator, slice: []*LValTagged, sym: []u8) EvalError!*LValTagged {
+    const x = LValTagged.pop(allocator, slice, 0);
+    errdefer x.free(allocator);
+
+    switch (x.*) {
+        .Num => |*num| {
+            if (std.mem.eql(u8, sym, "-") and slice.len == 0) {
+                num.* = -num.*;
+                return x;
+            }
+
+            var i: usize = 0;
+            while (i < slice.len) : (i += 1) {
+                switch (slice[i].*) {
+                    .Num => |other_num| {
+                        if (std.mem.eql(u8, sym, "+")) num.* += other_num;
+                        if (std.mem.eql(u8, sym, "-")) num.* -= other_num;
+                        if (std.mem.eql(u8, sym, "*")) num.* *= other_num;
+                        if (std.mem.eql(u8, sym, "/")) {
+                            if (other_num == 0)
+                                return EvalError.DivideByZero;
+                            num.* = @divTrunc(num.*, other_num);
+                        }
+                    },
+                    else => return EvalError.NotANumber,
+                }
+            }
+            return x;
+        },
+        else => return EvalError.NotANumber,
+    }
+}
+
+test "compile_builtin" {
+    // Force compilation
+    _ = try builtin_head(undefined, undefined);
+    _ = try builtin_op(undefined, undefined, undefined);
+}
 
 const LVal = struct {
     tagged: *LValTagged,
@@ -282,7 +307,8 @@ pub fn repl() ReplError!void {
 
     _ = c.mpca_lang(c.MPCA_LANG_DEFAULT,
         \\ number   : /-?[0-9]+/ ;
-        \\ symbol   : '+' | '-' | '*' | '/' ;
+        \\ symbol   : "list" | "head" | "tail"
+        \\          | "join" | "eval" | '+' | '-' | '*' | '/' ;
         \\ sexpr    : '(' <expr>* ')' ;
         \\ qexpr    : '{' <expr>* '}' ;
         \\ expr     : <number> | <symbol> | <sexpr> | <qexpr> ;
