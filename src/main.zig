@@ -3,7 +3,7 @@ const assert = @import("std").debug.assert;
 const c = @import("c.zig");
 const Allocator = std.mem.Allocator;
 
-const EvalError = error{
+const EvalError = Allocator.Error || error{
     InvalidOp,
     DivideByZero,
     FunctionNoSymbolStart,
@@ -20,6 +20,7 @@ fn eval_error_str(err: EvalError) []const u8 {
         EvalError.NotANumber => "Not a number",
         EvalError.TooManyArguments => "Too many arguments",
         EvalError.IncorrectTypes => "Incorrect types",
+        Allocator.Error.OutOfMemory => "Out of memory",
     };
 }
 
@@ -90,7 +91,7 @@ const LValTagged = union(Tag) {
                     defer f.free(allocator);
 
                     switch (f.*) {
-                        .Sym => |sym| return try builtin_op(allocator, cells, sym),
+                        .Sym => |sym| return try builtin(allocator, self, cells, sym),
                         else => return EvalError.FunctionNoSymbolStart,
                     }
                 } else {
@@ -117,10 +118,78 @@ fn builtin_head(allocator: *Allocator, slice: []*LValTagged) EvalError!*LValTagg
 
     switch (v.*) {
         .Qexpr => |cells_opt| if (cells_opt) |cells|
-            return LValTagged.pop(allocator, cells, 0),
+            return LValTagged.pop(allocator, cells, 0)
+        else
+            return EvalError.InvalidOp,
+        else => return EvalError.IncorrectTypes,
+    }
+}
+
+fn builtin_tail(allocator: *Allocator, slice: []*LValTagged) EvalError!*LValTagged {
+    if (slice.len != 1) return EvalError.TooManyArguments;
+
+    const tail = LValTagged.pop(allocator, slice, 0);
+    errdefer tail.free(allocator);
+
+    switch (tail.*) {
+        .Qexpr => |cells_opt| if (cells_opt) |cells| {
+            LValTagged.pop(allocator, cells, 0).free(allocator);
+            return tail;
+        } else {
+            return EvalError.InvalidOp;
+        },
+        else => return EvalError.IncorrectTypes,
+    }
+}
+
+fn builtin_list(allocator: *Allocator, val: *LValTagged) *LValTagged {
+    switch (val.*) {
+        .Sexpr => |cells_opt| val.* = LValTagged{ .Qexpr = cells_opt },
         else => {},
     }
-    return EvalError.IncorrectTypes;
+    return val;
+}
+
+fn builtin_eval(allocator: *Allocator, slice: []*LValTagged) EvalError!*LValTagged {
+    if (slice.len != 1) return EvalError.TooManyArguments;
+    const v = LValTagged.pop(allocator, slice, 0);
+    errdefer v.free(allocator);
+
+    switch (v.*) {
+        .Sexpr => {},
+        .Qexpr => |cells_opt| v.* = LValTagged{ .Sexpr = cells_opt },
+        else => return EvalError.IncorrectTypes,
+    }
+
+    const result = try v.eval(allocator);
+    if (result != v) v.free(allocator);
+    return result;
+}
+
+fn builtin_join(allocator: *Allocator, slice: []*LValTagged) EvalError!*LValTagged {
+    var x = LValTagged.pop(allocator, slice, 0);
+    errdefer x.free(allocator);
+    while (slice.len > 0) {
+        const y = LValTagged.pop(allocator, slice, 0);
+        defer y.free(allocator);
+        x = try lval_join(allocator, x, y);
+    }
+    return x;
+}
+
+fn lval_join(allocator: *Allocator, x: *LValTagged, y: *LValTagged) EvalError!*LValTagged {
+    var x_temp = x;
+    switch (y.*) {
+        .Qexpr => |cells_opt| if (cells_opt) |cells| {
+            while (cells.len > 0) {
+                const cell = LValTagged.pop(allocator, cells, 0);
+                errdefer cell.free(allocator);
+                x_temp = try lval_add(allocator, x_temp, cell);
+            }
+        },
+        else => return EvalError.IncorrectTypes,
+    }
+    return x_temp;
 }
 
 fn builtin_op(allocator: *Allocator, slice: []*LValTagged, sym: []u8) EvalError!*LValTagged {
@@ -156,10 +225,14 @@ fn builtin_op(allocator: *Allocator, slice: []*LValTagged, sym: []u8) EvalError!
     }
 }
 
-test "compile_builtin" {
-    // Force compilation
-    _ = try builtin_head(undefined, undefined);
-    _ = try builtin_op(undefined, undefined, undefined);
+fn builtin(allocator: *Allocator, self: *LValTagged, slice: []*LValTagged, func: []u8) EvalError!*LValTagged {
+    if (std.mem.eql(u8, func, "list")) return builtin_list(allocator, self);
+    if (std.mem.eql(u8, func, "head")) return builtin_head(allocator, slice);
+    if (std.mem.eql(u8, func, "tail")) return builtin_tail(allocator, slice);
+    if (std.mem.eql(u8, func, "join")) return builtin_join(allocator, slice);
+    if (std.mem.eql(u8, func, "eval")) return builtin_eval(allocator, slice);
+    // TODO(DarinM223): throw error if func is not an operator.
+    return builtin_op(allocator, slice, func);
 }
 
 const LVal = struct {
@@ -245,20 +318,24 @@ fn lval_read(allocator: *Allocator, node: *c.mpc_ast_t) ReadError!LVal {
         if (c.strcmp(node.children[i].*.contents, "{") == 0) continue;
         if (c.strcmp(node.children[i].*.contents, "}") == 0) continue;
         if (c.strcmp(node.children[i].*.tag, "regex") == 0) continue;
-        x = try lval_add(allocator, x.?, try lval_read(allocator, node.children[i]));
+        const child = (try lval_read(allocator, node.children[i])).tagged;
+        x = LVal{
+            .tagged = try lval_add(allocator, x.?.tagged, child),
+            .allocator = allocator,
+        };
     }
     return x.?;
 }
 
-fn lval_add(allocator: *Allocator, v: LVal, x: LVal) ReadError!LVal {
-    switch (v.tagged.*) {
+fn lval_add(allocator: *Allocator, v: *LValTagged, x: *LValTagged) Allocator.Error!*LValTagged {
+    switch (v.*) {
         .Sexpr, .Qexpr => |*expr_opt| {
             if (expr_opt.*) |*expr| {
                 expr.* = try allocator.realloc(expr.*, expr.*.len + 1);
-                expr.*[expr.*.len - 1] = x.tagged;
+                expr.*[expr.*.len - 1] = x;
             } else {
                 expr_opt.* = try allocator.alloc(*LValTagged, 1);
-                expr_opt.*.?[0] = x.tagged;
+                expr_opt.*.?[0] = x;
             }
         },
         else => {},
@@ -314,7 +391,7 @@ pub fn repl() ReplError!void {
         \\ expr     : <number> | <symbol> | <sexpr> | <qexpr> ;
         \\ lispy    : /^/ <expr>* /$/ ;
     , Number, Symbol, Sexpr, Qexpr, Expr, Lispy);
-    defer c.mpc_cleanup(4, Number, Symbol, Sexpr, Qexpr, Expr, Lispy);
+    defer c.mpc_cleanup(6, Number, Symbol, Sexpr, Qexpr, Expr, Lispy);
 
     var input: [2048]u8 = undefined;
     const stdin = std.io.getStdIn();
