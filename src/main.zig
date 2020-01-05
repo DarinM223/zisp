@@ -10,6 +10,7 @@ const EvalError = Allocator.Error || error{
     NotANumber,
     TooManyArguments,
     IncorrectTypes,
+    UnknownFunction,
 };
 
 fn eval_error_str(err: EvalError) []const u8 {
@@ -20,6 +21,7 @@ fn eval_error_str(err: EvalError) []const u8 {
         EvalError.NotANumber => "Not a number",
         EvalError.TooManyArguments => "Too many arguments",
         EvalError.IncorrectTypes => "Incorrect types",
+        EvalError.UnknownFunction => "Unknown function",
         Allocator.Error.OutOfMemory => "Out of memory",
     };
 }
@@ -114,13 +116,17 @@ fn builtin_head(allocator: *Allocator, slice: []*LValTagged) EvalError!*LValTagg
     if (slice.len != 1) return EvalError.TooManyArguments;
 
     const v = LValTagged.pop(allocator, slice, 0);
-    defer v.free(allocator);
+    errdefer v.free(allocator);
 
     switch (v.*) {
-        .Qexpr => |cells_opt| if (cells_opt) |cells|
-            return LValTagged.pop(allocator, cells, 0)
-        else
-            return EvalError.InvalidOp,
+        .Qexpr => |cells_opt| if (cells_opt) |cells| {
+            while (cells.len > 1) {
+                LValTagged.pop(allocator, cells, 1).free(allocator);
+            }
+            return v;
+        } else {
+            return EvalError.InvalidOp;
+        },
         else => return EvalError.IncorrectTypes,
     }
 }
@@ -156,7 +162,6 @@ fn builtin_eval(allocator: *Allocator, slice: []*LValTagged) EvalError!*LValTagg
     errdefer v.free(allocator);
 
     switch (v.*) {
-        .Sexpr => {},
         .Qexpr => |cells_opt| v.* = LValTagged{ .Sexpr = cells_opt },
         else => return EvalError.IncorrectTypes,
     }
@@ -231,8 +236,8 @@ fn builtin(allocator: *Allocator, self: *LValTagged, slice: []*LValTagged, func:
     if (std.mem.eql(u8, func, "tail")) return builtin_tail(allocator, slice);
     if (std.mem.eql(u8, func, "join")) return builtin_join(allocator, slice);
     if (std.mem.eql(u8, func, "eval")) return builtin_eval(allocator, slice);
-    // TODO(DarinM223): throw error if func is not an operator.
-    return builtin_op(allocator, slice, func);
+    if (std.mem.indexOf(u8, "+-/*", func) != null) return builtin_op(allocator, slice, func);
+    return EvalError.UnknownFunction;
 }
 
 const LVal = struct {
@@ -408,23 +413,11 @@ pub fn repl() ReplError!void {
             var lval = try lval_read(std.heap.direct_allocator, ptr);
             defer lval.deinit();
 
-            lval.eval() catch |e| switch (e) {
-                EvalError.InvalidOp, EvalError.DivideByZero, EvalError.FunctionNoSymbolStart, EvalError.NotANumber => {
-                    std.debug.warn("{}\n", .{eval_error_str(e)});
-                    continue;
-                },
-                else => |err| return err,
+            lval.eval() catch |e| {
+                std.debug.warn("{}\n", .{eval_error_str(e)});
+                continue;
             };
             lval.print();
-
-            //var result = eval(ptr) catch |e| switch (e) {
-            //    EvalError.DivideByZero => {
-            //        std.debug.warn("Divide by zero\n", .{});
-            //        continue;
-            //    },
-            //    else => |err| return err,
-            //};
-            //std.debug.warn("{}\n", .{result});
         } else {
             var ptr = @ptrCast([*c]c.mpc_err_t, @field(r, "error").?);
             defer c.mpc_err_delete(ptr);
